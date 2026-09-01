@@ -1895,3 +1895,89 @@ def test_fix_preserves_typescript_language_for_remaining_findings(tmp_path, caps
 
     assert remaining == len(check_data["findings"])
     assert fix_exit == 0
+
+
+def _unwrapped(out: str) -> str:
+    """Console output with rich's line wrapping collapsed.
+
+    These assertions are on whole sentences, and rich breaks them at the
+    terminal width -- which is where the bug being pinned actually shows,
+    so the output has to stay rendered rather than be read off the reason
+    string directly.
+    """
+    return " ".join(out.split())
+
+
+# --- the message that goes with those exit codes ---------------------------
+#
+# The exit codes above were right from the start; the sentence printed above
+# them was not. `unscannable_reason` explained the *rule set's* coverage
+# ("JavaScript is read by 3 of 21 rules -- enough to report findings") in
+# exactly the two shapes where none of those rules ran, so it appeared over
+# an empty findings list, directly under a headline saying nothing was
+# scannable. Both halves were true of the tool and false of the run.
+
+
+def test_the_reason_does_not_promise_findings_when_no_rule_ran(tmp_path, capsys):
+    (tmp_path / "server.js").write_text(
+        'const sessionId = req.headers["Mcp-Session-Id"];\n'
+    )
+    assert main(["check", str(tmp_path), "--rule", "R001"]) == 2
+    out = _unwrapped(capsys.readouterr().out)
+    assert "Nothing scannable here." in out
+    assert "no rule that ran reads JavaScript" in out
+    # The contradiction, pinned by its exact words: this claim may never
+    # appear beneath a "nothing scannable" headline.
+    assert "enough to report findings" not in out
+
+
+def test_a_config_that_disables_every_ported_rule_says_so_too(tmp_path, capsys):
+    # Same hole reached without `--rule`: config switches off all three
+    # rules that read JavaScript, so again nothing looked at the file.
+    (tmp_path / "server.js").write_text(
+        'const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");\n'
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.mcp-migrate.rules]\nR006 = false\nR017 = false\nR021 = false\n"
+    )
+    assert main(["check", str(tmp_path)]) == 2
+    out = _unwrapped(capsys.readouterr().out)
+    assert "no rule that ran reads JavaScript" in out
+    assert "enough to report findings" not in out
+
+
+def test_a_language_that_was_read_is_still_described_by_its_coverage(tmp_path, capsys):
+    # The guard against over-correcting: when the ported rules *do* run,
+    # the fraction is the right thing to print and must not be replaced.
+    (tmp_path / "server.js").write_text(
+        'const e = { code: -32002, message: "resource not found" };\n'
+    )
+    assert main(["check", str(tmp_path)]) == 1
+    out = _unwrapped(capsys.readouterr().out)
+    assert "JavaScript is read by 3 of 21 rules" in out
+    assert "no rule that ran" not in out
+
+
+def test_one_language_read_and_one_not_is_described_per_language(tmp_path, capsys):
+    # `--rule R001` covers TypeScript but not JavaScript, so the two
+    # clauses must disagree with each other. The headline stays "No grade
+    # for this one" because something genuinely was read.
+    (tmp_path / "a.js").write_text('const x = 1;\n')
+    (tmp_path / "b.ts").write_text(
+        'const sessionId = req.headers["Mcp-Session-Id"];\n'
+    )
+    main(["check", str(tmp_path), "--rule", "R001"])
+    out = _unwrapped(capsys.readouterr().out)
+    assert "JavaScript was read by no rule that ran" in out
+    assert "TypeScript is read by every rule" in out
+    assert "Nothing scannable" not in out
+
+
+def test_the_reason_survives_rich_markup(tmp_path, capsys):
+    # `[rules]` in the prose was swallowed as a rich style tag, printing
+    # "a config  table" -- the same class of bug #246 fixed for config
+    # warnings. Assert on rendered output, which is where it showed.
+    (tmp_path / "server.js").write_text('const x = 1;\n')
+    main(["check", str(tmp_path), "--rule", "R001"])
+    out = _unwrapped(capsys.readouterr().out)
+    assert "rules table in config" in out
