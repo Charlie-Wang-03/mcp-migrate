@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-12
+
 ### Added
 
 - **A GitHub Action, so the tool can run in CI without a bespoke workflow.** ([#100](https://github.com/dheerajjha/mcp-migrate/issues/100))
