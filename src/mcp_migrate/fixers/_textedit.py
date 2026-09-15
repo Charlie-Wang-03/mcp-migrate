@@ -20,6 +20,15 @@ CLOSE = ")]}"
 # not parse (see `strip_parenthesised_import_members`).
 _FROM_IMPORT_PAREN_RX = re.compile(r"^\s*from\s+\S+\s+import\s*\(")
 
+# A `def`/`async def` header -- the one suite shape `sole_function_body_lines`
+# recognises (see it for why the others are left to the #244 guard).
+_DEF_HEADER_RX = re.compile(r"^\s*(?:async\s+)?def\b")
+# The fixers that ask about function bodies also read TypeScript, where a
+# line starting `def` is not a function at all, so the scan is gated to the
+# files it is true for. Kept in sync with the "python" entries of
+# `languages.EXTENSIONS`.
+_PYTHON_SUFFIXES = frozenset({".py", ".pyi"})
+
 
 def find_matching_close(lines: list[str], open_idx: int, open_col: int) -> tuple[int, int] | None:
     """Given the position of an opening bracket (any of `([{`), return the
@@ -188,6 +197,87 @@ def _strip_members_in_text(text, hit_fn):
     if comment:
         joined += "  " + comment
     return indent + joined + newline, True, True
+
+
+def _live_line(line: str) -> bool:
+    """True for a line that holds a suite open: not blank, not a comment."""
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith("#")
+
+
+def _opens_suite(line: str) -> bool:
+    """True if `line` ends in the `:` that indents a block beneath it.
+
+    A trailing comment is not part of the header, so `def f():  # noqa`
+    counts. Splitting on the first `#` is the same shortcut
+    `_strip_members_in_text` takes, and it errs the safe way: a `#` inside a
+    string literal truncates the line, the colon goes missing, and the header
+    is simply not recognised.
+    """
+    return line.split("#", 1)[0].rstrip().endswith(":")
+
+
+def sole_function_body_lines(lines, path: Path) -> set[int]:
+    """The 1-indexed lines that are the only live statement of a function body.
+
+    Commenting one of those out leaves `def handlers():` with nothing under
+    it, which does not parse -- so the #244 guard refuses the whole file and
+    the user gets no fix at all. That is the sole-statement half of #245;
+    callers keep an indented `pass` beside the TODO for these lines.
+
+    The signal is indentation, not a parse: a body runs from its `def` header
+    down to the next live line indented no deeper than the header, so the
+    single live line under it is the whole body. That is Python's own rule
+    for the shapes in question, and the only other read of the source is the
+    `string_lines` call below -- which matters, because the file in hand is
+    often mid-migration and may not parse at all. A header counts only when
+    it plainly opens a block and is not string data, and the body only when
+    one live line sits under it -- itself code rather than string data, since
+    the repair edits that line -- so a docstring, a second statement or a
+    nested block all decline the case on their own.
+
+    Everything else keeps the pre-existing outcome, where the file is refused
+    rather than edited (#244). That is the safe direction to be wrong in: a
+    `pass` nobody needed is a stray no-op in someone's diff, while a missing
+    one costs them the whole file.
+    """
+    if path.suffix.lower() not in _PYTHON_SUFFIXES:
+        return set()
+    # Prose is not structure: a `def` written inside a triple-quoted string is
+    # a code example in a docstring, and a `pass` written under it would land
+    # in the user's string data (the #105 family). `string_lines` is this
+    # module's existing answer to "which lines are string data"; it fails safe
+    # on source it cannot tokenize (every line comes back), which declines the
+    # case rather than guessing at it.
+    #
+    # Headers only. A docstring is a statement like any other -- it is exactly
+    # what keeps a body non-empty -- so body lines are counted as they are, and
+    # filtering them out would invent a `pass` for a body that still holds one.
+    string_data = string_lines("".join(lines), path)
+    out: set[int] = set()
+    for i, line in enumerate(lines):
+        if i + 1 in string_data:
+            continue
+        if not _DEF_HEADER_RX.match(line) or not _opens_suite(line):
+            continue
+        header_indent = len(leading_ws(line))
+        body = []
+        for j in range(i + 1, len(lines)):
+            if not _live_line(lines[j]):
+                continue
+            if len(leading_ws(lines[j])) <= header_indent:
+                break  # dedented: the body ended, and it was not empty
+            body.append(j)
+        # The one line still has to be code. A docstring holding the flagged
+        # name is the body's only statement *and* string data, and commenting
+        # it out with a `pass` under it writes an edit inside the user's
+        # string -- turning a #244 refusal into a parseable one (#105's
+        # family). String data is counted as the statement it is, so that a
+        # body keeping a docstring is never called empty; it just cannot be
+        # the line the repair acts on.
+        if len(body) == 1 and (body[0] + 1) not in string_data:
+            out.add(body[0] + 1)
+    return out
 
 
 def string_lines(source: str, path_or_lang: str | Path = "python") -> set[int]:

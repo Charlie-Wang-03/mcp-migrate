@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Comment-out fixers no longer empty a function body.**
+  ([#245](https://github.com/dheerajjha/mcp-migrate/issues/245))
+
+  The other half of #249. R009, R011, R012, R013 and R019 comment out lines
+  that reference a removed symbol, and the only statement a function has is
+  as load-bearing as an import member: commenting it out left
+  `def handlers():` with no suite, which does not parse -- so the #244 guard
+  refused the file and nothing got fixed. Those lines now keep an indented
+  `pass` beside the TODO. The shape is recognised from indentation alone (a
+  `def` header outside any string, with one live line under it); anything
+  else is still refused rather than guessed at.
+
 ## [0.7.0] - 2026-09-14
 
 ### Fixed

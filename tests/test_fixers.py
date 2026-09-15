@@ -976,6 +976,131 @@ def test_r011_strips_member_when_comment_rides_on_the_import_line():
 
 
 # ---------------------------------------------------------------------------
+# #245 -- the other half: the only statement in a function body
+# ---------------------------------------------------------------------------
+# These fixers also comment out ordinary statement lines, and the only
+# statement a function has is structurally load-bearing in the same way an
+# import member is: commenting it out leaves `def handlers():` with no suite,
+# which does not parse, so the #244 guard refused the whole file and the user
+# got no fix at all -- the reproduction in the issue's body. Recognising the
+# shape lets the fixer leave a `pass` under the TODO instead.
+
+# (fixer name, a member that fixer flags) -- same table the import half uses,
+# since it is the same five fixers over the same SDK names.
+SOLE_BODY_CASES = [(n, m) for n, m, _ in IMPORT_STRIPPING_CASES]
+
+
+@pytest.mark.parametrize("name,member", SOLE_BODY_CASES)
+def test_comment_out_fixer_keeps_a_pass_when_it_empties_the_body(name, member):
+    before = f"def handlers():\n    return {member}\n"
+
+    result = fix(name, before)
+
+    assert result.changed
+    # The finding is still flagged -- the line is commented out, with its
+    # TODO directly above it ...
+    lines = result.text.splitlines()
+    assert lines[-3].startswith("    # TODO(mcp-migrate)")
+    assert lines[-2] == f"    # return {member}"
+    # ... and the block it was holding open is not left empty.
+    assert lines[-1] == "    pass"
+    ast.parse(result.text)
+
+
+@pytest.mark.parametrize("name,member", SOLE_BODY_CASES)
+def test_comment_out_fixer_leaves_a_body_that_holds_something_else_alone(name, member):
+    """A docstring is a statement too: nothing is emptied, so nothing is
+    invented to fill the body in."""
+    before = f'def handlers():\n    """Doc."""\n    return {member}\n'
+
+    result = fix(name, before)
+
+    assert result.changed
+    assert f"    # return {member}" in result.text
+    assert "\n    pass\n" not in result.text
+    ast.parse(result.text)
+
+
+@pytest.mark.parametrize("name,member", SOLE_BODY_CASES)
+def test_comment_out_fixer_sole_body_fix_is_idempotent(name, member):
+    before = f"def handlers():\n    return {member}\n"
+
+    once = fix(name, before)
+    twice = fix(name, once.text)
+
+    assert twice.changed is False
+    assert twice.text == once.text
+
+
+def test_sole_body_pass_is_not_added_to_a_def_inside_a_string():
+    """A def-shaped snippet in a triple-quoted string is prose, not a function
+    body. Reading it as structure would write a `pass` into the user's string
+    data, widening the pre-existing #105-family blind spot rather than
+    inheriting it."""
+    before = (
+        'DOC = """\n'
+        "def handlers():\n"
+        "    return PingRequest\n"
+        '"""\n'
+    )
+
+    result = fix("PingRemovedFixer", before)
+
+    assert "\n    pass\n" not in result.text
+    ast.parse(result.text)
+
+
+def test_a_docstring_only_body_is_left_to_the_guard_rather_than_given_a_pass(tmp_path, capsys):
+    """The body's one line is itself string data. Commenting the docstring out
+    and dropping a `pass` under it writes an edit inside the user's string,
+    where the guard used to refuse the file -- so the sole-body repair declines
+    and the refusal stands."""
+    src = 'def handlers():\n    """PingRequest"""\n'
+    target = tmp_path / "docstring.py"
+    target.write_text(src)
+
+    assert "\n    pass\n" not in fix("PingRemovedFixer", src).text
+
+    main(["fix", str(tmp_path), "--write"])
+    out = capsys.readouterr().out
+
+    assert target.read_text() == src
+    assert "refused" in out
+
+
+def test_sole_body_fix_keeps_an_unterminated_last_line_unterminated():
+    """`pass` has to start a line of its own even when the statement it
+    replaces ended the file without a newline -- but it takes that ending
+    over, rather than adding one the file never had."""
+    result = fix("PingRemovedFixer", "def handlers():\n    return PingRequest")
+
+    assert result.changed
+    assert result.text.endswith("\n    pass")
+    assert not result.text.endswith("\n")
+    ast.parse(result.text)
+
+
+def test_the_sole_body_case_is_fixed_rather_than_refused(tmp_path, capsys):
+    """The end-to-end version, over the exact file from #245's body: the fix
+    is applied, the result parses, and the findings it was made for are gone
+    -- not merely tolerated by the guard."""
+    target = tmp_path / "shim.py"
+    target.write_text(STRUCTURAL_ONLY_SHIM)
+
+    exit_code = main(["fix", str(tmp_path), "--write"])
+    out = capsys.readouterr().out
+    after = target.read_text()
+
+    assert "refused" not in out
+    assert "\n    pass\n" in after
+    ast.parse(after)
+    assert exit_code == 0
+
+    remaining = {f.rule_id for f in run_check(tmp_path)[2]}
+    assert not remaining & {"R009", "R011", "R012", "R013", "R019"}
+
+
+# ---------------------------------------------------------------------------
 # R017 -- resource-not-found error code
 # ---------------------------------------------------------------------------
 
@@ -1908,9 +2033,14 @@ def test_r001_fixer_skips_docstring_and_comments_code_line():
 # The guard lives in `cmd_fix` rather than in each fixer on purpose: it is
 # the one place where "did I just break this file" is cheap and certain to
 # answer, and it cannot be forgotten by the next fixer someone writes. The
-# per-fixer cure is a separate and larger job.
+# per-fixer cure for the shapes #245 named shipped separately -- imports in
+# #249, sole function bodies alongside it (see the section above) -- and the
+# backstop still owns everything those did not cover.
 
-STRUCTURAL_ONLY_IMPORT = '''"""Thin protocol shim over the MCP SDK."""
+# The reproduction from #245's body, now fixed rather than refused: both a
+# parenthesised import that empties and a function body whose only statement
+# goes away. Kept here because it is the shape the guard was written for.
+STRUCTURAL_ONLY_SHIM = '''"""Thin protocol shim over the MCP SDK."""
 from mcp.types import (
     PingRequest,
     SetLevelRequest,
@@ -1921,15 +2051,24 @@ def handlers():
     return {"ping": PingRequest, "setLevel": SetLevelRequest}
 '''
 
+# What the guard still owns: the one statement being commented out holds up
+# a suite that is not a function's own -- here an `if`. Curing that means a
+# general suite-repair engine, which is not what a fixer here is allowed to
+# become, so the file is refused rather than half-edited.
+STRUCTURAL_ONLY_SUITE = '''def handlers(flag):
+    if flag:
+        return {"ping": PingRequest}
+'''
+
 
 def test_fix_refuses_an_edit_that_would_break_the_file(tmp_path, capsys):
-    target = tmp_path / "shim.py"
-    target.write_text(STRUCTURAL_ONLY_IMPORT)
+    target = tmp_path / "nested.py"
+    target.write_text(STRUCTURAL_ONLY_SUITE)
 
     exit_code = main(["fix", str(tmp_path), "--write"])
     out = capsys.readouterr().out
 
-    assert target.read_text() == STRUCTURAL_ONLY_IMPORT, (
+    assert target.read_text() == STRUCTURAL_ONLY_SUITE, (
         "fix --write rewrote a file into source that does not parse"
     )
     ast.parse(target.read_text())
@@ -1939,13 +2078,13 @@ def test_fix_refuses_an_edit_that_would_break_the_file(tmp_path, capsys):
 
 def test_a_refusal_does_not_block_the_files_that_are_fine(tmp_path, capsys):
     """One bad file must not cost the user every other fix in the tree."""
-    (tmp_path / "bad.py").write_text(STRUCTURAL_ONLY_IMPORT)
+    (tmp_path / "bad.py").write_text(STRUCTURAL_ONLY_SUITE)
     (tmp_path / "good.py").write_text("RESOURCE_NOT_FOUND = -32002\n")
 
     exit_code = main(["fix", str(tmp_path), "--write"])
 
     assert "-32602" in (tmp_path / "good.py").read_text(), "good.py was not fixed"
-    assert (tmp_path / "bad.py").read_text() == STRUCTURAL_ONLY_IMPORT
+    assert (tmp_path / "bad.py").read_text() == STRUCTURAL_ONLY_SUITE
     assert exit_code == 1
 
 
@@ -1964,7 +2103,7 @@ def test_a_file_that_was_already_broken_is_not_our_fault(tmp_path, capsys):
 def test_the_dry_run_refuses_too(tmp_path, capsys):
     """A diff we would decline to write is its own kind of lie -- the whole
     point of the dry run is that it shows what --write would do."""
-    (tmp_path / "shim.py").write_text(STRUCTURAL_ONLY_IMPORT)
+    (tmp_path / "nested.py").write_text(STRUCTURAL_ONLY_SUITE)
 
     main(["fix", str(tmp_path)])
     out = capsys.readouterr().out
