@@ -312,6 +312,27 @@ def _py_string_lines(
     source: str, total_lines: int, all_lines: set[int], io_mod: any, tok_mod: any
 ) -> set[int]:
     lines: set[int] = set()
+    # PEP 701 (3.12+) stops emitting one STRING for an f-string: it splits the
+    # literal into FSTRING_START / FSTRING_MIDDLE / FSTRING_END, so the STRING
+    # branch below matches nothing and a multiline f-string used to come back
+    # empty -- an empty set being indistinguishable from "no string data here"
+    # for every caller, and unlike the fail-safe at the bottom it raises
+    # nothing to trigger on. The two names do not exist before 3.12, where
+    # `getattr` leaves them None and both branches below are unreachable, so
+    # the <=3.11 single-STRING path is untouched: this is parity with it, not
+    # a redesign of it.
+    fstring_start = getattr(tok_mod, "FSTRING_START", None)
+    fstring_end = getattr(tok_mod, "FSTRING_END", None)
+    # A stack rather than one remembered span. An f-string nested inside a
+    # replacement field pushes its own entry, so the END token that pops it is
+    # the one that closes *it* -- pairing a START with the next END regardless
+    # of nesting would end the outer span at the inner literal's closing
+    # quotes and under-report the rest of it. Marking each popped entry on its
+    # own also covers the mirror shape, where the inner literal is the
+    # triple-quoted one and the outer is not: on <=3.11 that is exactly what
+    # the tokenizer hands over as a STRING, because its own scanner finds the
+    # inner `'''`, so marking it is parity too.
+    open_fstrings: list[tuple[int, bool]] = []
     try:
         g = tok_mod.generate_tokens(io_mod.StringIO(source).readline)
         for tok in g:
@@ -321,6 +342,21 @@ def _py_string_lines(
                     s_line = tok.start[0]
                     e_line = tok.end[0]
                     lines.update(range(s_line, e_line + 1))
+            elif fstring_start is not None and tok.type == fstring_start:
+                head = tok.string.lstrip("rRbBuUfF")
+                open_fstrings.append(
+                    (tok.start[0], head.startswith('"""') or head.startswith("'''"))
+                )
+            elif fstring_end is not None and tok.type == fstring_end:
+                if open_fstrings:
+                    s_line, triple = open_fstrings.pop()
+                    if triple:
+                        # The whole literal, replacement fields included. On
+                        # <=3.11 the single STRING token covers those lines
+                        # too, so callers already treat them as string data;
+                        # telling literal text from embedded code is a
+                        # separate question this helper does not answer.
+                        lines.update(range(s_line, tok.end[0] + 1))
     except (tok_mod.TokenError, SyntaxError, IndentationError, ValueError):
         return all_lines
     return lines

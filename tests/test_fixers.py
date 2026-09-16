@@ -1050,6 +1050,66 @@ def test_sole_body_pass_is_not_added_to_a_def_inside_a_string():
     ast.parse(result.text)
 
 
+# The classification the fixer's guard reads, asserted on directly here rather
+# than only through the text the fixer emits.
+from mcp_migrate.fixers._textedit import sole_function_body_lines
+
+
+def test_sole_body_pass_is_not_added_to_a_def_inside_an_fstring():
+    """The f-string spelling of the case above, and the regression reported
+    against this change: on 3.12+ PEP 701 hands the tokenizer FSTRING_START /
+    FSTRING_MIDDLE / FSTRING_END instead of one STRING, `string_lines` reported
+    no string data for the literal, and the def-shaped snippet in it read as
+    real structure -- so `pass` was written into the user's string data on
+    3.12+ and only there.
+
+    What is pinned is that new failure mode and nothing else. R011 already
+    comments flagged lines out inside string data, on every version, and that
+    predates this change; asserting an exact output here would freeze that
+    older defect as required behaviour, so the assertions below are about the
+    two halves of this one -- the literal gets no `pass`, and the look-alike in
+    it is not classified as a body -- while the real handler outside the
+    literal still gets the `pass` it needs. A repair that merely stopped
+    emitting `pass` anywhere would fail the third assertion.
+    """
+    before = (
+        'from mcp.types import PingRequest\n'
+        '\n'
+        "DOC = f'''\n"
+        'def handlers():\n'
+        '    return PingRequest\n'
+        "'''\n"
+        '\n'
+        '\n'
+        'def real_handler():\n'
+        '    return PingRequest\n'
+    )
+
+    result = fix("PingRemovedFixer", before)
+
+    assert result.changed
+
+    # The classification half: the def-shaped text in the literal is prose, so
+    # the only sole body named is the real handler's, outside the literal.
+    src_lines = before.splitlines()
+    doc_open = src_lines.index("DOC = f'''") + 1  # 1-indexed, as the helper counts
+    doc_close = src_lines.index("'''", doc_open) + 1
+    sole = sole_function_body_lines(before.splitlines(keepends=True), Path("server.py"))
+    assert len(sole) == 1, sole
+    (sole_line,) = sole
+    assert not doc_open <= sole_line <= doc_close
+
+    # The emitted half: between the literal's own quotes, no statement was
+    # written into it ...
+    parts = result.text.split("'''")
+    assert len(parts) == 3, parts
+    _, literal, after_literal = parts
+    assert "pass" not in literal
+    # ... and the real handler past the literal still holds its body open.
+    assert "\n    pass\n" in after_literal
+    ast.parse(result.text)
+
+
 def test_a_docstring_only_body_is_left_to_the_guard_rather_than_given_a_pass(tmp_path, capsys):
     """The body's one line is itself string data. Commenting the docstring out
     and dropping a `pass` under it writes an edit inside the user's string,
@@ -1973,6 +2033,50 @@ def test_string_lines_helper_detects_python_docstrings_and_ts_template_literals(
 
     ts_src = "let a = 1;\nconst b = `\nmultiline\ntemplate\n`;\nlet c = 2;\n"
     assert string_lines(ts_src, "typescript") == {2, 3, 4, 5}
+
+
+# PEP 701 (3.12+) stops emitting one STRING for an f-string and splits it into
+# FSTRING_START / FSTRING_MIDDLE / FSTRING_END, so the helper reported no
+# string data at all for a multiline f-string -- the span these tests pin, and
+# the review finding on #279. On <=3.11 the single STRING token already
+# covered it, so every expectation below holds there too: the property is
+# parity between the two tokenizers, not new behaviour on either.
+
+
+def test_string_lines_marks_a_multiline_fstring_span():
+    src = 'x = 1\nDOC = f"""\ndef f():\n    return 1\n"""\ny = 2\n'
+    assert string_lines(src, "python") == {2, 3, 4, 5}
+
+
+def test_string_lines_counts_fstring_replacement_field_lines_as_string_data():
+    """Parity with <=3.11, where the one STRING token spans the replacement
+    field as well. Telling literal text apart from the Python inside `{...}`
+    is a different question, deliberately not answered here."""
+    src = 'DOC = f"""\ndef f():\n    return {x}\n"""\n'
+    assert string_lines(src, "python") == {1, 2, 3, 4}
+
+
+@pytest.mark.parametrize("prefix", ["f", "rf", "Rf", "fr"])
+def test_string_lines_marks_every_fstring_prefix_spelling(prefix):
+    src = f'DOC = {prefix}"""\ntext\n"""\n'
+    assert string_lines(src, "python") == {1, 2, 3}
+
+
+@pytest.mark.parametrize(
+    "src,expected",
+    [
+        # The inner literal closes before the outer one does: matching a START
+        # against the next END, ignoring nesting, would stop the span at line 2.
+        ("DOC = f\"\"\"\n{ f\"{inner}\" }\n\"\"\"\n", {1, 2, 3}),
+        # Mirror shape, where the *inner* literal is the triple-quoted one. On
+        # <=3.11 this source reports anything at all only because the
+        # tokenizer's own scanner finds that inner `'''`.
+        ("DOC = f\"{ f'''\ninner\n''' }\"\n", {1, 2, 3}),
+        ("DOC = f\"\"\"\n{ f'''\ninner\n''' }\n\"\"\"\n", {1, 2, 3, 4, 5}),
+    ],
+)
+def test_string_lines_marks_nested_fstrings_past_the_inner_closing_quotes(src, expected):
+    assert string_lines(src, "python") == expected
 
 
 def test_fixers_decline_to_edit_inside_docstrings_issue_105():
