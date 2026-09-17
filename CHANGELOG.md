@@ -6,6 +6,16 @@ All notable changes to this project are documented here.
 
 ### Fixed
 
+- **Fixers no longer edit inside an f-string on Python 3.12 and later.**
+  PEP 701 stopped tokenising an f-string as one `STRING`, splitting it into
+  `FSTRING_START` / `FSTRING_MIDDLE` / `FSTRING_END` — so the string-detection
+  pass matched nothing and a multiline f-string came back as *no string data at
+  all*, which is indistinguishable from a file with no strings in it. A fixer
+  was then free to comment out a line that was literal text inside the
+  f-string. Measured on 3.14: a four-line f-string reported zero string lines
+  before this, four after. Nested f-strings are tracked on a stack so an inner
+  literal's closing quotes cannot end the outer span early.
+
 - **Comment-out fixers no longer empty a function body.**
   ([#245](https://github.com/dheerajjha/mcp-migrate/issues/245))
 
